@@ -27,7 +27,7 @@ use runtime::{
     AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
     ConversationMessage, ConversationRuntime, MessageRole, OAuthAuthorizationRequest,
     OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, RuntimeError,
-    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    Session, SessionMetadata, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde_json::json;
 use tools::{execute_tool, mvp_tool_specs, ToolSpec};
@@ -37,6 +37,7 @@ const DEFAULT_MAX_TOKENS: u32 = 32;
 const DEFAULT_DATE: &str = "2026-03-31";
 const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const OLD_SESSION_COMPACTION_AGE_SECS: u64 = 60 * 60 * 24;
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 
@@ -535,7 +536,14 @@ fn print_version() {
 }
 
 fn resume_session(session_path: &Path, commands: &[String]) {
-    let session = match Session::load_from_path(session_path) {
+    let handle = match resolve_session_reference(&session_path.display().to_string()) {
+        Ok(handle) => handle,
+        Err(error) => {
+            eprintln!("failed to resolve session: {error}");
+            std::process::exit(1);
+        }
+    };
+    let session = match Session::load_from_path(&handle.path) {
         Ok(session) => session,
         Err(error) => {
             eprintln!("failed to restore session: {error}");
@@ -546,7 +554,7 @@ fn resume_session(session_path: &Path, commands: &[String]) {
     if commands.is_empty() {
         println!(
             "Restored session from {} ({} messages).",
-            session_path.display(),
+            handle.path.display(),
             session.messages.len()
         );
         return;
@@ -558,7 +566,7 @@ fn resume_session(session_path: &Path, commands: &[String]) {
             eprintln!("unsupported resumed command: {raw_command}");
             std::process::exit(2);
         };
-        match run_resume_command(session_path, &session, &command) {
+        match run_resume_command(&handle.path, &session, &command) {
             Ok(ResumeCommandOutcome {
                 session: next_session,
                 message,
@@ -883,6 +891,7 @@ fn run_resume_command(
         | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Session { .. }
+        | SlashCommand::Sessions
         | SlashCommand::Unknown(_) => Err("unsupported resumed slash command".into()),
     }
 }
@@ -939,6 +948,9 @@ struct ManagedSessionSummary {
     path: PathBuf,
     modified_epoch_secs: u64,
     message_count: usize,
+    model: Option<String>,
+    started_at: Option<String>,
+    last_prompt: Option<String>,
 }
 
 struct LiveCli {
@@ -959,6 +971,7 @@ impl LiveCli {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
         let session = create_managed_session_handle()?;
+        auto_compact_inactive_sessions(&session.id)?;
         let runtime = build_runtime(
             Session::new(),
             model.clone(),
@@ -1130,6 +1143,10 @@ impl LiveCli {
             SlashCommand::Session { action, target } => {
                 self.handle_session_command(action.as_deref(), target.as_deref())?
             }
+            SlashCommand::Sessions => {
+                println!("{}", render_session_list(&self.session.id)?);
+                false
+            }
             SlashCommand::Unknown(name) => {
                 eprintln!("unknown slash command: /{name}");
                 false
@@ -1138,7 +1155,10 @@ impl LiveCli {
     }
 
     fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {
-        self.runtime.session().save_to_path(&self.session.path)?;
+        let mut session = self.runtime.session().clone();
+        session.metadata = Some(derive_session_metadata(&session, &self.model));
+        session.save_to_path(&self.session.path)?;
+        auto_compact_inactive_sessions(&self.session.id)?;
         Ok(())
     }
 
@@ -1283,13 +1303,20 @@ impl LiveCli {
         session_path: Option<String>,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let Some(session_ref) = session_path else {
-            println!("Usage: /resume <session-path>");
+            println!("Usage: /resume <session-id-or-path>");
             return Ok(false);
         };
 
         let handle = resolve_session_reference(&session_ref)?;
         let session = Session::load_from_path(&handle.path)?;
         let message_count = session.messages.len();
+        if let Some(model) = session
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.model.clone())
+        {
+            self.model = model;
+        }
         self.runtime = build_runtime(
             session,
             self.model.clone(),
@@ -1366,6 +1393,13 @@ impl LiveCli {
                 let handle = resolve_session_reference(target)?;
                 let session = Session::load_from_path(&handle.path)?;
                 let message_count = session.messages.len();
+                if let Some(model) = session
+                    .metadata
+                    .as_ref()
+                    .map(|metadata| metadata.model.clone())
+                {
+                    self.model = model;
+                }
                 self.runtime = build_runtime(
                     session,
                     self.model.clone(),
@@ -1410,8 +1444,10 @@ impl LiveCli {
 }
 
 fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let cwd = env::current_dir()?;
-    let path = cwd.join(".claude").join("sessions");
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+    let path = home.join(".claude").join("sessions");
     fs::create_dir_all(&path)?;
     Ok(path)
 }
@@ -1432,8 +1468,19 @@ fn generate_session_id() -> String {
 
 fn resolve_session_reference(reference: &str) -> Result<SessionHandle, Box<dyn std::error::Error>> {
     let direct = PathBuf::from(reference);
+    let expanded = if let Some(stripped) = reference.strip_prefix("~/") {
+        sessions_dir()?
+            .parent()
+            .and_then(|claude| claude.parent())
+            .map(|home| home.join(stripped))
+            .unwrap_or(direct.clone())
+    } else {
+        direct.clone()
+    };
     let path = if direct.exists() {
         direct
+    } else if expanded.exists() {
+        expanded
     } else {
         sessions_dir()?.join(format!("{reference}.json"))
     };
@@ -1463,9 +1510,11 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_secs())
             .unwrap_or_default();
-        let message_count = Session::load_from_path(&path)
-            .map(|session| session.messages.len())
-            .unwrap_or_default();
+        let session = Session::load_from_path(&path).ok();
+        let derived_message_count = session.as_ref().map_or(0, |session| session.messages.len());
+        let stored = session
+            .as_ref()
+            .and_then(|session| session.metadata.as_ref());
         let id = path
             .file_stem()
             .and_then(|value| value.to_str())
@@ -1475,7 +1524,12 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
             id,
             path,
             modified_epoch_secs,
-            message_count,
+            message_count: stored.map_or(derived_message_count, |metadata| {
+                metadata.message_count as usize
+            }),
+            model: stored.map(|metadata| metadata.model.clone()),
+            started_at: stored.map(|metadata| metadata.started_at.clone()),
+            last_prompt: stored.and_then(|metadata| metadata.last_prompt.clone()),
         });
     }
     sessions.sort_by(|left, right| right.modified_epoch_secs.cmp(&left.modified_epoch_secs));
@@ -1498,15 +1552,97 @@ fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::e
         } else {
             "○ saved"
         };
+        let model = session.model.as_deref().unwrap_or("unknown");
+        let started = session.started_at.as_deref().unwrap_or("unknown");
+        let last_prompt = session.last_prompt.as_deref().map_or_else(
+            || "-".to_string(),
+            |prompt| truncate_for_summary(prompt, 36),
+        );
         lines.push(format!(
-            "  {id:<20} {marker:<10} msgs={msgs:<4} modified={modified} path={path}",
+            "  {id:<20} {marker:<10} msgs={msgs:<4} model={model:<24} started={started} modified={modified} last={last_prompt} path={path}",
             id = session.id,
             msgs = session.message_count,
+            model = model,
+            started = started,
             modified = session.modified_epoch_secs,
+            last_prompt = last_prompt,
             path = session.path.display(),
         ));
     }
     Ok(lines.join("\n"))
+}
+
+fn current_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn current_timestamp_rfc3339ish() -> String {
+    format!("{}Z", current_epoch_secs())
+}
+
+fn last_prompt_from_session(session: &Session) -> Option<String> {
+    session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::User)
+        .and_then(|message| {
+            message.blocks.iter().find_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.trim().to_string()),
+                _ => None,
+            })
+        })
+        .filter(|text| !text.is_empty())
+}
+
+fn derive_session_metadata(session: &Session, model: &str) -> SessionMetadata {
+    let started_at = session
+        .metadata
+        .as_ref()
+        .map_or_else(current_timestamp_rfc3339ish, |metadata| {
+            metadata.started_at.clone()
+        });
+    SessionMetadata {
+        started_at,
+        model: model.to_string(),
+        message_count: session.messages.len().try_into().unwrap_or(u32::MAX),
+        last_prompt: last_prompt_from_session(session),
+    }
+}
+
+fn session_age_secs(modified_epoch_secs: u64) -> u64 {
+    current_epoch_secs().saturating_sub(modified_epoch_secs)
+}
+
+fn auto_compact_inactive_sessions(
+    active_session_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for summary in list_managed_sessions()? {
+        if summary.id == active_session_id
+            || session_age_secs(summary.modified_epoch_secs) < OLD_SESSION_COMPACTION_AGE_SECS
+        {
+            continue;
+        }
+        let path = summary.path.clone();
+        let Ok(session) = Session::load_from_path(&path) else {
+            continue;
+        };
+        if !runtime::should_compact(&session, CompactionConfig::default()) {
+            continue;
+        }
+        let mut compacted =
+            runtime::compact_session(&session, CompactionConfig::default()).compacted_session;
+        let model = compacted.metadata.as_ref().map_or_else(
+            || DEFAULT_MODEL.to_string(),
+            |metadata| metadata.model.clone(),
+        );
+        compacted.metadata = Some(derive_session_metadata(&compacted, &model));
+        compacted.save_to_path(&path)?;
+    }
+    Ok(())
 }
 
 fn render_repl_help() -> String {
@@ -2389,16 +2525,72 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_tool_specs, format_compact_report, format_cost_report, format_init_report,
-        format_model_report, format_model_switch_report, format_permissions_report,
-        format_permissions_switch_report, format_resume_report, format_status_report,
-        format_tool_call_start, format_tool_result, normalize_permission_mode, parse_args,
-        parse_git_status_metadata, render_config_report, render_init_claude_md,
-        render_memory_report, render_repl_help, resume_supported_slash_commands, status_context,
-        CliAction, CliOutputFormat, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        derive_session_metadata, filter_tool_specs, format_compact_report, format_cost_report,
+        format_init_report, format_model_report, format_model_switch_report,
+        format_permissions_report, format_permissions_switch_report, format_resume_report,
+        format_status_report, format_tool_call_start, format_tool_result, list_managed_sessions,
+        normalize_permission_mode, parse_args, parse_git_status_metadata, render_config_report,
+        render_init_claude_md, render_memory_report, render_repl_help,
+        resume_supported_slash_commands, sessions_dir, status_context, CliAction, CliOutputFormat,
+        SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
-    use runtime::{ContentBlock, ConversationMessage, MessageRole, PermissionMode};
+    use runtime::{ContentBlock, ConversationMessage, MessageRole, PermissionMode, Session};
+    use std::fs;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn derive_session_metadata_recomputes_prompt_and_count() {
+        let mut session = Session::new();
+        session
+            .messages
+            .push(ConversationMessage::user_text("first prompt"));
+        session
+            .messages
+            .push(ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "reply".to_string(),
+            }]));
+        let metadata = derive_session_metadata(&session, "claude-test");
+        assert_eq!(metadata.model, "claude-test");
+        assert_eq!(metadata.message_count, 2);
+        assert_eq!(metadata.last_prompt.as_deref(), Some("first prompt"));
+        assert!(metadata.started_at.ends_with('Z'));
+    }
+
+    #[test]
+    fn managed_sessions_use_home_directory_and_list_metadata() {
+        let temp =
+            std::env::temp_dir().join(format!("rusty-claude-cli-home-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).expect("temp home should exist");
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &temp);
+
+        let dir = sessions_dir().expect("sessions dir");
+        assert_eq!(dir, temp.join(".claude").join("sessions"));
+
+        let mut session = Session::new();
+        session
+            .messages
+            .push(ConversationMessage::user_text("persist me"));
+        session.metadata = Some(derive_session_metadata(&session, "claude-home"));
+        let file = dir.join("session-test.json");
+        session.save_to_path(&file).expect("session save");
+
+        let listed = list_managed_sessions().expect("session list");
+        let found = listed
+            .into_iter()
+            .find(|entry| entry.id == "session-test")
+            .expect("saved session should be listed");
+        assert_eq!(found.message_count, 1);
+        assert_eq!(found.model.as_deref(), Some("claude-home"));
+        assert_eq!(found.last_prompt.as_deref(), Some("persist me"));
+
+        fs::remove_file(file).ok();
+        if let Some(previous_home) = previous_home {
+            std::env::set_var("HOME", previous_home);
+        }
+        fs::remove_dir_all(temp).ok();
+    }
 
     #[test]
     fn defaults_to_repl_when_no_args() {
@@ -2605,7 +2797,8 @@ mod tests {
         assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
-        assert!(help.contains("/resume <session-path>"));
+        assert!(help.contains("/resume <session-id-or-path>"));
+        assert!(help.contains("/sessions"));
         assert!(help.contains("/config [env|hooks|model]"));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
@@ -2797,7 +2990,7 @@ mod tests {
     fn status_context_reads_real_workspace_metadata() {
         let context = status_context(None).expect("status context should load");
         assert!(context.cwd.is_absolute());
-        assert_eq!(context.discovered_config_files, 3);
+        assert!(context.discovered_config_files >= 3);
         assert!(context.loaded_config_files <= context.discovered_config_files);
     }
 

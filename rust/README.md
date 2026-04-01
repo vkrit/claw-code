@@ -133,6 +133,7 @@ Inside the REPL, useful commands include:
 /diff
 /version
 /export notes.txt
+/sessions
 /session list
 /exit
 ```
@@ -143,14 +144,14 @@ Inspect or maintain a saved session file without entering the REPL:
 
 ```bash
 cd rust
-cargo run -p rusty-claude-cli -- --resume session.json /status /compact /cost
+cargo run -p rusty-claude-cli -- --resume session-123456 /status /compact /cost
 ```
 
 You can also inspect memory/config state for a restored session:
 
 ```bash
 cd rust
-cargo run -p rusty-claude-cli -- --resume session.json /memory /config
+cargo run -p rusty-claude-cli -- --resume ~/.claude/sessions/session-123456.json /memory /config
 ```
 
 ## Available commands
@@ -158,7 +159,7 @@ cargo run -p rusty-claude-cli -- --resume session.json /memory /config
 ### Top-level CLI commands
 
 - `prompt <text...>` — run one prompt non-interactively
-- `--resume <session.json> [/commands...]` — inspect or maintain a saved session
+- `--resume <session-id-or-path> [/commands...]` — inspect or maintain a saved session stored under `~/.claude/sessions/`
 - `dump-manifests` — print extracted upstream manifest counts
 - `bootstrap-plan` — print the current bootstrap skeleton
 - `system-prompt [--cwd PATH] [--date YYYY-MM-DD]` — render the synthesized system prompt
@@ -176,13 +177,14 @@ cargo run -p rusty-claude-cli -- --resume session.json /memory /config
 - `/permissions [read-only|workspace-write|danger-full-access]` — inspect or switch permissions
 - `/clear [--confirm]` — clear the current local session
 - `/cost` — show token usage totals
-- `/resume <session-path>` — load a saved session into the REPL
+- `/resume <session-id-or-path>` — load a saved session into the REPL
 - `/config [env|hooks|model]` — inspect discovered Claude config
 - `/memory` — inspect loaded instruction memory files
 - `/init` — create a starter `CLAUDE.md`
 - `/diff` — show the current git diff for the workspace
 - `/version` — print version and build metadata locally
 - `/export [file]` — export the current conversation transcript
+- `/sessions` — list recent managed local sessions from `~/.claude/sessions/`
 - `/session [list|switch <session-id>]` — inspect or switch managed local sessions
 - `/exit` — leave the REPL
 

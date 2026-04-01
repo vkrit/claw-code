@@ -84,7 +84,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "resume",
         summary: "Load a saved session into the REPL",
-        argument_hint: Some("<session-path>"),
+        argument_hint: Some("<session-id-or-path>"),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -129,6 +129,12 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         argument_hint: Some("[list|switch <session-id>]"),
         resume_supported: false,
     },
+    SlashCommandSpec {
+        name: "sessions",
+        summary: "List recent managed local sessions",
+        argument_hint: None,
+        resume_supported: false,
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +169,7 @@ pub enum SlashCommand {
         action: Option<String>,
         target: Option<String>,
     },
+    Sessions,
     Unknown(String),
 }
 
@@ -207,6 +214,7 @@ impl SlashCommand {
                 action: parts.next().map(ToOwned::to_owned),
                 target: parts.next().map(ToOwned::to_owned),
             },
+            "sessions" => Self::Sessions,
             other => Self::Unknown(other.to_string()),
         })
     }
@@ -291,6 +299,7 @@ pub fn handle_slash_command(
         | SlashCommand::Version
         | SlashCommand::Export { .. }
         | SlashCommand::Session { .. }
+        | SlashCommand::Sessions
         | SlashCommand::Unknown(_) => None,
     }
 }
@@ -365,6 +374,10 @@ mod tests {
                 target: Some("abc123".to_string())
             })
         );
+        assert_eq!(
+            SlashCommand::parse("/sessions"),
+            Some(SlashCommand::Sessions)
+        );
     }
 
     #[test]
@@ -378,7 +391,7 @@ mod tests {
         assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
-        assert!(help.contains("/resume <session-path>"));
+        assert!(help.contains("/resume <session-id-or-path>"));
         assert!(help.contains("/config [env|hooks|model]"));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
@@ -386,7 +399,8 @@ mod tests {
         assert!(help.contains("/version"));
         assert!(help.contains("/export [file]"));
         assert!(help.contains("/session [list|switch <session-id>]"));
-        assert_eq!(slash_command_specs().len(), 15);
+        assert!(help.contains("/sessions"));
+        assert_eq!(slash_command_specs().len(), 16);
         assert_eq!(resume_supported_slash_commands().len(), 11);
     }
 
@@ -404,6 +418,7 @@ mod tests {
                     text: "recent".to_string(),
                 }]),
             ],
+            metadata: None,
         };
 
         let result = handle_slash_command(
@@ -468,5 +483,6 @@ mod tests {
         assert!(
             handle_slash_command("/session list", &session, CompactionConfig::default()).is_none()
         );
+        assert!(handle_slash_command("/sessions", &session, CompactionConfig::default()).is_none());
     }
 }

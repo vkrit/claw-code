@@ -40,9 +40,18 @@ pub struct ConversationMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMetadata {
+    pub started_at: String,
+    pub model: String,
+    pub message_count: u32,
+    pub last_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
     pub version: u32,
     pub messages: Vec<ConversationMessage>,
+    pub metadata: Option<SessionMetadata>,
 }
 
 #[derive(Debug)]
@@ -82,6 +91,7 @@ impl Session {
         Self {
             version: 1,
             messages: Vec::new(),
+            metadata: None,
         }
     }
 
@@ -111,6 +121,9 @@ impl Session {
                     .collect(),
             ),
         );
+        if let Some(metadata) = &self.metadata {
+            object.insert("metadata".to_string(), metadata.to_json());
+        }
         JsonValue::Object(object)
     }
 
@@ -131,13 +144,56 @@ impl Session {
             .iter()
             .map(ConversationMessage::from_json)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { version, messages })
+        let metadata = object
+            .get("metadata")
+            .map(SessionMetadata::from_json)
+            .transpose()?;
+        Ok(Self {
+            version,
+            messages,
+            metadata,
+        })
     }
 }
 
 impl Default for Session {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl SessionMetadata {
+    #[must_use]
+    pub fn to_json(&self) -> JsonValue {
+        let mut object = BTreeMap::new();
+        object.insert(
+            "started_at".to_string(),
+            JsonValue::String(self.started_at.clone()),
+        );
+        object.insert("model".to_string(), JsonValue::String(self.model.clone()));
+        object.insert(
+            "message_count".to_string(),
+            JsonValue::Number(i64::from(self.message_count)),
+        );
+        if let Some(last_prompt) = &self.last_prompt {
+            object.insert(
+                "last_prompt".to_string(),
+                JsonValue::String(last_prompt.clone()),
+            );
+        }
+        JsonValue::Object(object)
+    }
+
+    fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
+        let object = value.as_object().ok_or_else(|| {
+            SessionError::Format("session metadata must be an object".to_string())
+        })?;
+        Ok(Self {
+            started_at: required_string(object, "started_at")?,
+            model: required_string(object, "model")?,
+            message_count: required_u32(object, "message_count")?,
+            last_prompt: optional_string(object, "last_prompt"),
+        })
     }
 }
 
@@ -368,6 +424,13 @@ fn required_string(
         .ok_or_else(|| SessionError::Format(format!("missing {key}")))
 }
 
+fn optional_string(object: &BTreeMap<String, JsonValue>, key: &str) -> Option<String> {
+    object
+        .get(key)
+        .and_then(JsonValue::as_str)
+        .map(ToOwned::to_owned)
+}
+
 fn required_u32(object: &BTreeMap<String, JsonValue>, key: &str) -> Result<u32, SessionError> {
     let value = object
         .get(key)
@@ -378,7 +441,8 @@ fn required_u32(object: &BTreeMap<String, JsonValue>, key: &str) -> Result<u32, 
 
 #[cfg(test)]
 mod tests {
-    use super::{ContentBlock, ConversationMessage, MessageRole, Session};
+    use super::{ContentBlock, ConversationMessage, MessageRole, Session, SessionMetadata};
+    use crate::json::JsonValue;
     use crate::usage::TokenUsage;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -386,6 +450,12 @@ mod tests {
     #[test]
     fn persists_and_restores_session_json() {
         let mut session = Session::new();
+        session.metadata = Some(SessionMetadata {
+            started_at: "2026-04-01T00:00:00Z".to_string(),
+            model: "claude-sonnet".to_string(),
+            message_count: 3,
+            last_prompt: Some("hello".to_string()),
+        });
         session
             .messages
             .push(ConversationMessage::user_text("hello"));
@@ -428,5 +498,23 @@ mod tests {
             restored.messages[1].usage.expect("usage").total_tokens(),
             17
         );
+        assert_eq!(restored.metadata, session.metadata);
+    }
+
+    #[test]
+    fn loads_legacy_session_without_metadata() {
+        let legacy = r#"{
+  "version": 1,
+  "messages": [
+    {
+      "role": "user",
+      "blocks": [{"type": "text", "text": "hello"}]
+    }
+  ]
+}"#;
+        let restored = Session::from_json(&JsonValue::parse(legacy).expect("legacy json"))
+            .expect("legacy session should parse");
+        assert_eq!(restored.messages.len(), 1);
+        assert!(restored.metadata.is_none());
     }
 }
